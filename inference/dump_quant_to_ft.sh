@@ -1,0 +1,1 @@
+python dump_quant_to_ft.py -o /dataHDD/test -i /dataHDD/ckpts/hf-llama-2-13b/int2-g128 -i_g 1 -weight_data_type fp16 -m_n llama_2_13b -b 2

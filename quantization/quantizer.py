@@ -25,7 +25,8 @@ class Round(Function):
 def pseudo_quantize_tensor(w, n_bit=8,
                            zero_point=True, q_group_size=-1,
                            inplace=False,
-                           get_scale_zp=False
+                           get_scale_zp=False,
+                           get_qweight=False,
                            ):
     org_w_shape = w.shape
     if q_group_size > 0:
@@ -57,8 +58,9 @@ def pseudo_quantize_tensor(w, n_bit=8,
         ((w.div_(scales).round_().add_(zeros)).clamp_(
             min_int, max_int).sub_(zeros)).mul_(scales)
     else:
-        w = (torch.clamp(torch.round(w / scales) +
-                         zeros, min_int, max_int) - zeros) * scales
+        w = torch.clamp(torch.round(w / scales) + zeros, min_int, max_int)
+        if not get_qweight:
+            w = (w - zeros) * scales
     assert torch.isnan(w).sum() == 0
 
     w = w.reshape(org_w_shape)
