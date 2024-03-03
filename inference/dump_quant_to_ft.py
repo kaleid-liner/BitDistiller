@@ -22,6 +22,7 @@ import sys
 from transformers import LlamaForCausalLM
 
 import torch
+import tvm
 
 # using numpy extension: https://github.com/GreenWaves-Technologies/bfloat16
 # install the library with `pip install bfloat16`
@@ -29,26 +30,12 @@ from bfloat16 import bfloat16
 
 sys.path.append("../")
 from quantization.quantizer import pseudo_quantize_tensor
-
-
-def general_compress(lowprecision_weight, source_bits=4, storage_dtype=np.int8):
-    elems_per_byte = 8 // source_bits
-    if lowprecision_weight.dtype == np.float16:
-        lowprecision_weight = lowprecision_weight.astype(dtype=np.int8)
-    int8_weight = np.zeros(
-        (
-            *lowprecision_weight.shape[:-1],
-            lowprecision_weight.shape[-1] // elems_per_byte,
-        ),
-        dtype=np.int8,
-    )
-    for j in range(lowprecision_weight.shape[-1] // elems_per_byte):
-        for k in range(elems_per_byte):
-            int8_weight[:, j] |= lowprecision_weight[:, j * elems_per_byte + k] << (
-                source_bits * k
-            )
-
-    return int8_weight.view(storage_dtype)
+from bitblas.quantization.utils import general_compress
+from bitblas.ops.matmul_dequantize import (
+    MatmulWeightOnlyDequantize,
+    MatmulWeightOnlyDequantizeConfig,
+)
+from bitblas.utils import get_target_from_env
 
 
 def get_weight_data_type(data_type):
@@ -187,15 +174,45 @@ def split_and_convert(args):
         else:
             return p.astype(np_weight_data_type)
 
+    target = tvm.target.Target(get_target_from_env())
+
     def bdquant(base_name):
         w = model_state_dict[f'{base_name}.weight']
         w, scales, zeros = pseudo_quantize_tensor(w, args.bits, q_group_size=128, get_scale_zp=True, get_qweight=True)
+        M = 1
+        N, K = w.shape
         w = general_compress(param_to_weights(w), source_bits=args.bits)
-        scale_zeros = zeros * scales
+        matmul_config = MatmulWeightOnlyDequantizeConfig(
+            M=M,
+            N=N,
+            K=K,
+            in_dtype="float16",
+            out_dtype="float16",
+            accum_dtype="float16",
+            bit=args.bits,
+            storage_dtype="int8",
+            source_format="uint",
+            with_scaling=True,
+            with_zeros=True,
+            group_size=128,
+            fast_decoding=True,
+            with_bias=False,
+            zeros_type="original",
+            propagate_a=False,
+            propagate_b=False,
+            layout="nt",
+        )
+        matmul = MatmulWeightOnlyDequantize(
+            config=matmul_config,
+            target=target,
+        )
+        if matmul.weight_transform is not None:
+            w = matmul.weight_transform(torch.from_numpy(w).cuda().cpu())
+
         model_state_dict.update({
-            f'{base_name}.qweight': w,
+            f'{base_name}.qweight': w.numpy(),
             f'{base_name}.scales': param_to_weights(scales),
-            f'{base_name}.zeros': param_to_weights(scale_zeros),
+            f'{base_name}.zeros': param_to_weights(zeros),
         })
 
     # layer-wise weights, example:
